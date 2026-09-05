@@ -1,0 +1,109 @@
+name: Build AgentPort RTX 4080 backend
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/ninfer-rtx4080
+    paths:
+      - '.release-build/v1.7.0-4080/**'
+      - 'scripts/ninfer-4080/**'
+      - '.github/workflows/build-ninfer-rtx4080.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-agentport:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse-validate RTX 4080 PowerShell helpers
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem '.\scripts\ninfer-4080\*.ps1' | ForEach-Object {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$tokens,[ref]$errors) | Out-Null
+            if($errors.Count -gt 0){
+              $messages = ($errors | ForEach-Object { "$($_.Extent.StartLineNumber): $($_.Message)" }) -join "`n"
+              throw "PowerShell parse validation failed for $($_.Name):`n$messages"
+            }
+          }
+
+      - name: Generate patched v1.7.1-4080 runtime
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $PWD '.release-build\v1.7.0-4080\generated'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          & '.\.release-build\v1.7.0-4080\Patch-AgentPort.ps1' `
+            -InputPath '.\.release-build\v1.6.2\AgentPort_v1.6.2.ps1' `
+            -OutputPath (Join-Path $out 'AgentPort_v1.7.1-4080.ps1')
+
+          $main = Get-Content '.\.release-build\v1.6.2\main.go' -Raw
+          $main = $main.Replace('1.6.2','1.7.1-4080')
+          [IO.File]::WriteAllText((Join-Path $out 'main.go'),$main,([Text.UTF8Encoding]::new($false)))
+
+          $resourceB64 = [regex]::Replace((Get-Content '.\.release-build\v1.6.2\rsrc_amd64.syso.b64' -Raw), '\s', '')
+          [IO.File]::WriteAllBytes((Join-Path $out 'rsrc_amd64.syso'), [Convert]::FromBase64String($resourceB64))
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: false
+
+      - name: Build Windows launcher
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = '.\.release-build\v1.7.0-4080\generated'
+          Push-Location $dir
+          go mod init agentport-v171-4080
+          go build -trimpath -ldflags='-s -w -H=windowsgui' -o 'AgentPort_v1.7.1-4080.exe' .
+          Pop-Location
+
+      - name: Validate generated package and benchmark kit
+        shell: powershell
+        run: |
+          $dir = '.\.release-build\v1.7.0-4080\generated'
+          $runtime = Join-Path $dir 'AgentPort_v1.7.1-4080.ps1'
+          $exe = Join-Path $dir 'AgentPort_v1.7.1-4080.exe'
+          $bench = '.\scripts\ninfer-4080\Benchmark-AgentPortMatrix-v2.ps1'
+          if(-not (Test-Path $exe)){ throw 'EXE missing' }
+          if((Get-Item $exe).Length -lt 500000){ throw 'EXE unexpectedly small' }
+          if(-not (Select-String -Path $runtime -Pattern 'Start-AgentPortNInfer4080IfEligible' -Quiet)){ throw 'NInfer injection missing' }
+          if(-not (Select-String -Path $runtime -Pattern "speculative_mode = 'Off'" -Quiet)){ throw 'RTX 4080 default speculation is not Off' }
+          if(-not (Select-String -Path $runtime -Pattern "offload_mode = 'Auto Fit \(Recommended\)'" -Quiet)){ throw 'RTX 4080 default offload mode is not Auto Fit Recommended' }
+          if(-not (Select-String -Path $runtime -Pattern '4080-ridge-text-v2' -Quiet)){ throw 'existing-config tuning migration missing' }
+          if(-not (Select-String -Path $runtime -Pattern 'Text-only AgentPort runtime: do not auto-load a multimodal projector' -Quiet)){ throw 'text-only mmproj suppression missing' }
+          if(-not (Select-String -Path $runtime -Pattern '--spec-type ngram-mod' -Quiet)){ throw 'existing ngram speculative modes missing' }
+          if(Select-String -Path $runtime -Pattern '--spec-type draft-mtp' -Quiet){ throw 'native MTP should not be forced by the AgentPort UI after 4080 measurements' }
+          if(-not (Select-String -Path $bench -Pattern '\$FreshPrompts' -Quiet)){ throw 'fresh-task suite missing' }
+          if(-not (Select-String -Path $bench -Pattern '\$RepetitivePrompts' -Quiet)){ throw 'repetitive-agent suite missing' }
+          if(-not (Select-String -Path $bench -Pattern 'NInfer is not installed/ready' -Quiet)){ throw 'strict NInfer readiness guard missing' }
+          if(-not (Select-String -Path $bench -Pattern '--fit-target 768' -Quiet)){ throw 'standardized TextGen fit target missing' }
+          foreach($required in @(
+            '.\scripts\ninfer-4080\Run-AgentPort4080-Benchmark.cmd',
+            '.\scripts\ninfer-4080\Install-NInfer4080.cmd',
+            '.\scripts\ninfer-4080\Bootstrap-NInfer4080.ps1',
+            '.\scripts\ninfer-4080\Install-NInfer4080.ps1',
+            '.\scripts\ninfer-4080\Start-NInfer4080.ps1',
+            '.\scripts\ninfer-4080\Set-AgentPortBackend.ps1'
+          )){ if(-not (Test-Path $required)){ throw "required test-kit file missing: $required" } }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AgentPort-v1.7.1-4080-fixed
+          path: |
+            .release-build/v1.7.0-4080/generated/AgentPort_v1.7.1-4080.exe
+            scripts/ninfer-4080/Benchmark-AgentPortMatrix-v2.ps1
+            scripts/ninfer-4080/Run-AgentPort4080-Benchmark.cmd
+            scripts/ninfer-4080/Install-NInfer4080.cmd
+            scripts/ninfer-4080/Bootstrap-NInfer4080.ps1
+            scripts/ninfer-4080/Install-NInfer4080.ps1
+            scripts/ninfer-4080/Start-NInfer4080.ps1
+            scripts/ninfer-4080/Set-AgentPortBackend.ps1
+            scripts/ninfer-4080/README.md
+          if-no-files-found: error
